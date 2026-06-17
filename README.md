@@ -110,5 +110,4 @@ The role-classification rules are **tuned to this PDF's font stack** (`IsidoraSa
 
 ## See also
 
-- [`AI_USAGE.md`](AI_USAGE.md) — reflection on AI tool usage during development, assumptions, and known gaps (as required by the task brief).
 - [`tests/fixtures/menu.golden.json`](tests/fixtures/menu.golden.json) — the byte-for-byte expected output for the sample PDF.
