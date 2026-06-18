@@ -4,7 +4,7 @@ from itertools import pairwise
 import pdfplumber
 
 from menu_extractor.classify import Role, word_role
-from menu_extractor.geometry import Line, Section, SubGroup, Thresholds, Word
+from menu_extractor.geometry import Line, Section, SectionBounds, SubGroup, Thresholds, Word
 from menu_extractor.normalize import clean_text
 
 # Multipliers applied to the median word font-size on the page to derive layout
@@ -21,11 +21,18 @@ DEFAULT_MEDIAN_SIZE = 10.0
 
 # A vertical line counts as a "page-level" column divider when it spans this much
 # of its column's height (otherwise it's an intra-section sub-column divider).
+# 0.6 separates the page-spanning rule from the short per-section dividers, which
+# in this PDF never reach much past half the page height.
 PAGE_DIVIDER_HEIGHT_RATIO = 0.6
 
 # Lines whose endpoints are within this many points of each other count as
-# axis-aligned (vertical or horizontal). Absorbs minor PDF jitter.
+# axis-aligned (vertical or horizontal). 0.5pt absorbs the sub-pixel jitter
+# pdfplumber reports for nominally straight vector lines.
 LINE_AXIS_TOLERANCE = 0.5
+
+# A vline split is only trusted if it actually divides the body into two or more
+# strips; otherwise we fall back to whitespace-gutter detection.
+MIN_STRIPS_FOR_SPLIT = 2
 
 
 def parse_page_layout(page: pdfplumber.page.Page) -> list[Section]:
@@ -115,7 +122,8 @@ def _sections_in_column(col_words: list[Word], all_vlines: list[dict], threshold
         next_top = header_lines[index + 1][0] if index + 1 < len(header_lines) else float("inf")
         header_set = set(words_in_header)
         body = [word for word in col_words if top < word.top < next_top and word not in header_set]
-        sub_groups = _build_sub_groups(body, all_vlines, top, next_top, col_left, col_right, thresholds)
+        bounds = SectionBounds(top=top, bottom=next_top, col_left=col_left, col_right=col_right)
+        sub_groups = _build_sub_groups(body, all_vlines, bounds, thresholds)
         if sub_groups and any(sub_group.lines for sub_group in sub_groups):
             sections.append(Section(header=clean_text(text), sub_groups=sub_groups))
     return sections
@@ -143,32 +151,19 @@ def _gather_header_lines(words: list[Word], line_tolerance: float) -> list[tuple
 def _build_sub_groups(
     body: list[Word],
     all_vlines: list[dict],
-    section_top: float,
-    section_bottom: float,
-    col_left: float,
-    col_right: float,
+    bounds: SectionBounds,
     thresholds: Thresholds,
 ) -> list[SubGroup]:
     if not body:
         return []
-    # Prefer explicit vertical lines inside the section's y-range *and* the
-    # column's x-range (a vline from the neighbouring column would otherwise
-    # leak across and silently collapse this section into one strip).
-    sub_dividers = sorted(
-        line["x0"]
-        for line in all_vlines
-        if line["top"] >= section_top - thresholds.line_tolerance
-        and line["bottom"] <= section_bottom + thresholds.line_tolerance
-        and abs(line["x0"] - line["x1"]) < LINE_AXIS_TOLERANCE
-        and col_left <= line["x0"] <= col_right
-    )
+    sub_dividers = _section_dividers(all_vlines, bounds, thresholds.line_tolerance)
 
     strips: list[list[Word]] = []
     if sub_dividers:
         strips = _split_at_x(body, sub_dividers)
     # If no vline was usable, or the split didn't produce at least two strips,
     # fall back to whitespace-gutter detection (e.g. SIGNATURE SAUCES / SIDES).
-    if len(strips) < 2:
+    if len(strips) < MIN_STRIPS_FOR_SPLIT:
         strips = _split_at_whitespace_gutter(body, thresholds)
     sub_groups: list[SubGroup] = []
     for strip in strips:
@@ -176,6 +171,21 @@ def _build_sub_groups(
         if lines:
             sub_groups.append(SubGroup(lines=lines))
     return sub_groups
+
+
+def _section_dividers(all_vlines: list[dict], bounds: SectionBounds, line_tolerance: float) -> list[float]:
+    """The x-positions of vertical lines that belong to this section: inside its
+    y-range *and* its column's x-range. The x-range guard matters — a vline from
+    the neighbouring column would otherwise leak across and silently collapse the
+    section into a single strip."""
+    return sorted(
+        line["x0"]
+        for line in all_vlines
+        if line["top"] >= bounds.top - line_tolerance
+        and line["bottom"] <= bounds.bottom + line_tolerance
+        and abs(line["x0"] - line["x1"]) < LINE_AXIS_TOLERANCE
+        and bounds.col_left <= line["x0"] <= bounds.col_right
+    )
 
 
 def _split_at_x(words: list[Word], dividers: list[float]) -> list[list[Word]]:
@@ -231,10 +241,10 @@ def _attach_prices_globally(sections: list[Section], prices: list[Word], line_to
     ]
     for price in prices:
         best: Line | None = None
-        best_x0 = -float("inf")
+        best_left = -float("inf")
         for line in all_lines:
-            if abs(line.top - price.top) <= line_tolerance and line.x0 < price.cx and line.x0 > best_x0:
-                best, best_x0 = line, line.x0
+            if abs(line.top - price.top) <= line_tolerance and line.x0 < price.cx and line.x0 > best_left:
+                best, best_left = line, line.x0
         if best is not None:
             best.price_token = f"{best.price_token} {price.text}".strip() if best.price_token else price.text
 
@@ -253,19 +263,24 @@ def _detect_sub_header(lines: list[Line]) -> tuple[str | None, list[Line]]:
     """Promote the first NAME-only line to a sub-header iff it has no price and
     every subsequent NAME line carries one (the JUMBO CHICKEN WINGS pattern)."""
     name_indices = [index for index, line in enumerate(lines) if _is_name_line(line)]
-    if len(name_indices) < 2:
+    if not _is_subheader_pattern(lines, name_indices):
         return None, lines
     first_index = name_indices[0]
-    first_line = lines[first_index]
-    if first_line.price_token is not None:
-        return None, lines
-    if not all(lines[index].price_token is not None for index in name_indices[1:]):
-        return None, lines
     sub_header_text = clean_text(
-        " ".join(word.text for word in first_line.words if word_role(word) in (Role.NAME, Role.ITEM))
+        " ".join(word.text for word in lines[first_index].words if word_role(word) in (Role.NAME, Role.ITEM))
     )
     remaining = [line for index, line in enumerate(lines) if index != first_index]
     return sub_header_text, remaining
+
+
+def _is_subheader_pattern(lines: list[Line], name_indices: list[int]) -> bool:
+    """True when the first NAME line is unpriced and every later NAME line is
+    priced — the signature of a parent label sitting above its priced tiers."""
+    if len(name_indices) < 2:
+        return False
+    if lines[name_indices[0]].price_token is not None:
+        return False
+    return all(lines[index].price_token is not None for index in name_indices[1:])
 
 
 def _is_name_line(line: Line) -> bool:
