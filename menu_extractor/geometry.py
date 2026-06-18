@@ -37,6 +37,17 @@ class Thresholds:
     line_tolerance: float
 
 
+@dataclass(frozen=True)
+class SectionBounds:
+    """The y-range of a section and the x-range of the column it lives in.
+    Used to pick only the vertical dividers that belong to this section."""
+
+    top: float
+    bottom: float
+    col_left: float
+    col_right: float
+
+
 @dataclass
 class SubGroup:
     """One vertical strip inside a section. `sub_header` is set when the strip

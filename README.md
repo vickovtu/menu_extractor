@@ -1,84 +1,89 @@
 # menu-extractor
 
-Extracts dishes from a two-column restaurant-menu PDF and emits normalized JSON.
+A small script that reads a two-column restaurant-menu PDF and writes out one
+normalized JSON record per dish.
 
 ```json
 {
-  "category": "BURGERS",
-  "dish_name": "ALL AMERICAN BURGER",
-  "price": 17.0,
-  "price_text": "$17",
-  "description": "7 oz. steakburger, choice of cheese, lettuce, tomato, onion, pickles, brioche bun",
-  "dish_id": "041"
+  "category": "LEADING OFF",
+  "dish_name": "JUMBO GERMAN PRETZEL",
+  "price": 16.0,
+  "price_text": "$16",
+  "description": "caramelized onion dip, queso blanco, house-made honey mustard",
+  "dish_id": "001"
 }
 ```
 
-## Why
+On the sample PDF (`data/espn_bet.pdf`) it produces 105 items across 17 sections.
 
-A naive `pdfplumber.extract_text()` reads the page across both columns and interleaves them. This extractor reads the page **structurally** — using the PDF's own vector lines as column/section dividers and the embedded font stack to classify each word's role — so the output preserves the visual hierarchy of the menu.
+## What the assignment asked for, and where it's handled
 
-Key properties:
+| Requirement | Where / how |
+|---|---|
+| Extract dishes from the target sections (`LEADING OFF`, `BURGERS`, …) | Sections come from the PDF's header-font lines — see `layout.py` |
+| Merge multi-line descriptions | `MenuBuilder` in `parse.py` walks dish lines and appends following body lines |
+| Handle missing prices and `$X` placeholders | `price` / `price_text` split in `normalize.py` — see [Prices](#prices) |
+| Normalize fields (whitespace, smart quotes, format) | `clean_text` in `normalize.py` (NFKC + quote folding + whitespace collapse) |
+| Python 3.12+, reproducible | Pure-Python, deterministic; `make install` / `make run` below |
+| Output JSON file | Written to `output/menu.json` (override with `-o`) |
 
-- **Pure deterministic Python** — no OCR, no LLM, no external API. Reproducible byte-for-byte across runs.
-- **Honest price model** — `price` (numeric) and `price_text` (raw token) are separate fields, so a `$X` placeholder is distinguishable from an unpriced item:
-
-  | Case                     | `price` | `price_text` |
-  |--------------------------|---------|--------------|
-  | Normal price (`$17`)     | `17.0`  | `"$17"`      |
-  | Placeholder (`$X`)       | `null`  | `"$X"`       |
-  | No price (e.g. a sauce)  | `null`  | `null`       |
-
-- **Sub-header folding** — parent labels like *JUMBO CHICKEN WINGS* above tier rows (`6 / 12 / 18 WINGS`) get folded into each tier's `dish_name` as `"JUMBO CHICKEN WINGS · 12 WINGS"`.
-- **Test-first** — unit + integration + a golden-fixture deep-equality test, with a 95% coverage gate.
-
-## Getting started
+## How to run
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 make install                                       # uv sync --extra dev
-make run                                           # writes output/menu.json
+make run                                            # writes output/menu.json
 # or directly:
 uv run python main.py data/espn_bet.pdf -o output/menu.json
 ```
 
-Output goes to `output/menu.json` by default. Override with `-o`.
-
-### Make targets
-
-| Target              | What it does                                       |
-|---------------------|----------------------------------------------------|
-| `make install`      | Install runtime + dev deps via `uv sync`           |
-| `make run`          | Extract from `data/espn_bet.pdf` to `output/menu.json` |
-| `make test`         | Run all tests (unit + integration)                 |
-| `make test-unit`    | Run unit tests only (fast, no PDF needed)          |
-| `make test-integration` | Run integration tests only                     |
-| `make coverage`     | Run tests with coverage, fail under 95%            |
-| `make lint`         | Ruff lint                                          |
-| `make fix`          | Ruff lint --fix + format                           |
-| `make check`        | Lint + format-check (CI gate)                      |
-| `make update-golden`| Regenerate `tests/fixtures/menu.golden.json`       |
-| `make clean`        | Remove caches and coverage artefacts               |
+Other useful targets: `make test` (all tests), `make check` (lint + format check),
+`make coverage` (tests with a 95% gate), `make update-golden` (regenerate the fixture).
 
 ## How it works
 
-The menu is a **digital PDF with a real text layer** (no OCR needed). Reading it correctly is two problems:
+The PDF has a real text layer, so there's no OCR. The hard part is that
+`pdfplumber.extract_text()` reads straight across both columns and interleaves
+them, so I read the page structurally instead.
 
-1. **Words, not text.** Each word is read with its coordinates and font via `pdfplumber`. The font name encodes the role unambiguously — casing alone fails because section headers *and* sauce names are upper-case:
+1. **Words, not text.** Each word is read with its coordinates and font name.
+   The font tells us a word's role more reliably than casing does — section
+   headers *and* sauce names are both upper-case, so casing alone can't tell
+   them apart:
    - `IsidoraSans-Black` → section header
    - `IsidoraSans-Bold` → dish name
    - `BETRegular` → price token
-   - `IsidoraSans-Medium` → body text (size ~10 = standalone item like a sauce; size ~8 = description)
+   - `IsidoraSans-Medium` → body (≈10pt is a standalone item like a sauce, ≈8pt is a description)
 
-2. **Line-driven hierarchical layout.** The PDF embeds a structural skeleton — a page-spanning vertical line, paired horizontal lines around section headers, and shorter vertical lines inside sub-columned blocks. The parser walks it top-down:
+2. **Layout from the page's own lines.** The PDF draws a page-spanning vertical
+   rule between the two columns, and shorter vertical rules inside multi-column
+   blocks. The parser walks them top-down:
 
-   **page → main columns (vlines) → sections (HEADER lines) → sub-groups (intra-section vlines, or whitespace gutter as fallback) → dish lines**
+   `page → columns (full-height vlines) → sections (header lines) → sub-groups (intra-section vlines, or the widest whitespace gutter as a fallback) → dish lines`
 
-3. **Sub-header folding.** Inside a sub-group, if the first NAME-font line has no price but every subsequent one carries one, the unpriced label is treated as a sub-header and folded into each tier's `dish_name`.
+3. **Sub-header folding.** When a sub-group starts with an unpriced label and
+   every line after it is priced — e.g. `JUMBO CHICKEN WINGS` over its `6 / 12 / 18`
+   tiers — the label is folded into each dish name as `JUMBO CHICKEN WINGS · 12 WINGS`.
 
-4. **Global price re-attachment.** Right-aligned prices often sit in the gutter between sub-columns. Each price is matched against every line on the page after the layout is built — closest line on the same row, starting left of the price wins.
+4. **Price re-attachment.** Right-aligned prices often sit in the gutter between
+   sub-columns, so I match each price to the nearest line on its row across the
+   whole page, rather than per sub-group.
 
-5. **Assembly.** A state machine walks each section's dish lines, merging multi-line descriptions and skipping section notes (e.g. *"served with choice of side"*) that appear before the first dish.
+5. **Assembly.** `MenuBuilder` walks each section's lines, merging multi-line
+   descriptions and skipping section notes (e.g. "served with choice of side")
+   that appear before the first dish.
+
+## Prices
+
+`price` (numeric) and `price_text` (the raw token) are separate fields so the
+three cases stay distinguishable:
+
+| Case | `price` | `price_text` | Example |
+|---|---|---|---|
+| Normal price | `16.0` | `"$16"` | `JUMBO GERMAN PRETZEL` |
+| Placeholder | `null` | `"$X"` | `4 WINGS & 4 SAUCES` |
+| No price | `null` | `null` | a sauce like `GARLIC PARMESAN` |
 
 ## Project structure
 
@@ -86,28 +91,49 @@ The menu is a **digital PDF with a real text layer** (no OCR needed). Reading it
 menu-extractor/
 ├── main.py                          # CLI entry-point
 ├── menu_extractor/
-│   ├── geometry.py                  # Word / Line / Section / SubGroup / Thresholds
+│   ├── geometry.py                  # Word / Line / Section / SubGroup / SectionBounds / Thresholds
 │   ├── classify.py                  # font signature → Role
-│   ├── normalize.py                 # NFKC, smart-quote cleanup, price parsing
+│   ├── normalize.py                 # NFKC, quote cleanup, price parsing
 │   ├── models.py                    # MenuItem (pydantic) + DraftItem
 │   ├── layout.py                    # PDF page → ordered list[Section]
 │   ├── parse.py                     # MenuBuilder: Section → MenuItem
 │   └── extract.py                   # PDF → list[MenuItem]
 ├── tests/
-│   ├── conftest.py                  # shared pytest fixtures + auto-tagging
 │   ├── unit/                        # pure-function tests
 │   ├── integration/                 # end-to-end + golden comparison
 │   └── fixtures/menu.golden.json
 ├── data/espn_bet.pdf                # sample input
-├── output/menu.json                 # generated
-├── pyproject.toml
-└── Makefile
+└── output/menu.json                 # generated
 ```
 
-## Scope and limitations
+## Limitations
 
-The role-classification rules are **tuned to this PDF's font stack** (`IsidoraSans-*` / `BETRegular`, 14pt / 16pt headers, paired-line section brackets). The layout helpers scale with the page's median word font-size, so segmentation would adapt to other typography, but `menu_extractor/classify.py` would need re-tuning to recognise the right fonts for a different menu.
+The role classification is tuned to this PDF's font stack (`IsidoraSans-*` /
+`BETRegular`, 14–16pt headers, paired-line section brackets). The layout
+helpers scale with the page's median word size, so the *segmentation* would
+adapt to other typography, but `classify.py` would need re-tuning to recognise
+the right fonts for a different menu. `dish_id` is a sequential counter over the
+output, not an identifier carried in the PDF.
 
-## See also
+## AI usage
 
-- [`tests/fixtures/menu.golden.json`](tests/fixtures/menu.golden.json) — the byte-for-byte expected output for the sample PDF.
+- **Tool.** I used AI as a coding agent to draft implementation and test code
+  while I selected the approach, tuned the heuristics, reviewed the output, and
+  verified behavior with tests.
+- **Division of labour.** I decided the module layout (geometry / classify /
+  normalize / layout / parse), the font-based classification approach, and the
+  `price` vs `price_text` model; the agent filled in the code and I corrected
+  naming, thresholds, and structure as it went.
+- **What I tuned by hand.** The layout thresholds (column-gutter and
+  line-tolerance multipliers) and the font signatures in `classify.py` are
+  specific to this PDF — I checked them against the actual output rather than
+  trusting generated defaults.
+- **Verification.** A golden-fixture test pins the full 105-item output, so any
+  change that altered extraction would fail the build. I ran a final
+  AI-assisted review over the code for readability and dead code.
+- **Known gaps.** See [Limitations](#limitations) — `classify.py` is
+  font-specific and would need re-tuning for a differently-typeset menu.
+- **Note on "no LLM."** The extractor itself uses no LLM or external API at
+  runtime — it's deterministic and reproducible. The AI usage above is about how
+  I *built* it, not what it does when you run it.
+
